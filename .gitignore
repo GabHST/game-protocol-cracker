@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+*.pcap
+decoded.json
+.venv/
