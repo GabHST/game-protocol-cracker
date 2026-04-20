@@ -1,5 +1,43 @@
+# Python build artefacts
 __pycache__/
-*.pyc
-*.pcap
-decoded.json
+*.py[cod]
+*.egg-info/
+*.egg
+.eggs/
+build/
+dist/
+wheels/
+pip-wheel-metadata/
+
+# Virtual environments
 .venv/
+venv/
+env/
+.env
+
+# Test & coverage artefacts
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+
+# Linters / type checkers
+.ruff_cache/
+.mypy_cache/
+.pytype/
+
+# Editors & IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Capture outputs (except synthetic test fixtures)
+*.pcap
+*.pcapng
+!tests/fixtures/sample.pcap
+decoded.json
+decoded.csv
