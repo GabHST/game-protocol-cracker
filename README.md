@@ -1,183 +1,319 @@
 # game-protocol-cracker
 
-Crack XOR rolling-key encrypted game protocols commonly used in mobile games.
+[![CI](https://github.com/GabHST/game-protocol-cracker/actions/workflows/ci.yml/badge.svg)](https://github.com/GabHST/game-protocol-cracker/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12-blue.svg)](https://www.python.org)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 
-> **Disclaimer:** This tool is for educational and security research purposes only. Use responsibly and only on applications you have authorization to test.
+Analyze XOR rolling-key encrypted game protocols: auto-detect keys, decode frames, export the results.
 
-## The Problem
+A generic, MIT-licensed reverse-engineering tool built on `scapy`, `click`, `rich` and
+(optionally) `blackboxprotobuf`. Bring your own pcap, pick a frame format, and read
+plaintext payloads in seconds.
 
-Many mobile games use a simple XOR rolling-key encryption for their TCP protocol. This is especially common in games built with Chinese game engines (JuFeng, 37Games SDK, etc.). While the encryption looks intimidating in a packet capture, it follows a predictable pattern that can be reversed.
+> **Scope:** security research and interoperability work on applications you are
+> authorized to analyze. Respect the terms of service of any third-party software
+> before running this against captured traffic.
 
-If you've captured game traffic with tcpdump and see gibberish payloads with readable command names, this tool is probably what you need.
+## Why this exists
 
-## How It Works
+A lot of mobile game SDKs protect their TCP messages with a per-message XOR
+whose round key is a monotonically incrementing 16-bit counter. Captures look
+like gibberish next to plaintext command names. The pattern is simple, but every
+game wraps it in a slightly different frame layout (magic bytes, length prefix,
+check byte...) and picks its own starting counter. This tool automates the
+boring parts:
 
-The XOR rolling-key pattern:
+* brute-force the starting counter per direction
+* decrypt every frame in the capture with the recovered keys
+* emit JSON / CSV for downstream analysis
+* give you a small Python API when the CLI isn't enough
 
-```
-For each message:
-  1. key = key + 1 (wrap at configurable threshold)
-  2. w8 = (~key) & 0xFF
-  3. w9 = ((~key >> 4) & 0x0F) | ((w8 << 4) & 0xFF0)
-  4. For each byte: plain = (~(enc ^ w9) - w8) & 0xFF
-```
-
-The tool auto-detects the initial key by trying values 0-19 and scoring decryption results by readability.
-
-## Features
-
-- **Auto-detect** initial encryption key from captured traffic
-- **Decode** all frames from a pcap capture
-- **Encrypt** payloads for replay testing
-- **Analyze** protocol patterns (command frequency, timing)
-- **Frame parser** for custom binary protocols (configurable magic bytes)
-- **PCAP parser** supporting both Ethernet and SLL link types
-
-## Usage
-
-### Capture traffic
+## Install
 
 ```bash
-# On rooted Android emulator
-adb shell su -c "tcpdump -i any -w /sdcard/capture.pcap port 9929"
+pip install game-protocol-cracker
+
+# optional: schema-less protobuf decoding
+pip install "game-protocol-cracker[protobuf]"
+```
+
+Python 3.10+ is required. Development install:
+
+```bash
+git clone https://github.com/GabHST/game-protocol-cracker
+cd game-protocol-cracker
+pip install -e ".[dev]"
+pytest
+```
+
+## Quick start
+
+### 1. Capture traffic
+
+Any pcap works. Common rooted-Android recipe:
+
+```bash
+adb shell su -c "tcpdump -i any -w /sdcard/capture.pcap port 9000"
 adb pull /sdcard/capture.pcap
 ```
 
-### Crack the protocol
+### 2. Crack the encryption
 
 ```bash
-# Auto-detect key and decode everything
-python protocol_cracker.py crack capture.pcap
-
-# Save decoded frames to JSON
-python protocol_cracker.py crack capture.pcap -o decoded.json
+python -m game_protocol_cracker crack capture.pcap --port 9000 -o decoded.json
 ```
 
-### Decode with known key
+Example output:
+
+```
+---------------------------------- capture.pcap -----------------------------------
++--------------------------------------------+
+| Direction | Best key | Confidence | Frames |
+|-----------+----------+------------+--------|
+| C2S       | 0        | 100%       | 147    |
+| S2C       | 2        |  96%       | 201    |
++--------------------------------------------+
++-------------------------------------------------------------+
+| Dir | Command            | Bytes | Preview                  |
+|-----+--------------------+-------+--------------------------|
+| C2S | LoginReqC2S        |    24 | ..player-demo..token-123 |
+| S2C | LoginRspS2C        |    17 | ..ok..session-abc        |
+| C2S | KeepAliveC2S       |     6 | ..ping                   |
+| ...                                                         |
++-------------------------------------------------------------+
+```
+
+### 3. Inspect with a known key
+
+If you already know the starting counter (e.g. from RE of the client):
 
 ```bash
-python protocol_cracker.py decode capture.pcap --key 2
+python -m game_protocol_cracker decode capture.pcap --port 9000 \
+    --c2s-key 0 --s2c-key 2
 ```
 
-### Analyze patterns
+### 4. Analyze patterns
 
 ```bash
-python protocol_cracker.py analyze capture.pcap
+python -m game_protocol_cracker analyze capture.pcap --port 9000
 ```
 
-### Encrypt for replay
+Produces a per-command histogram and inter-frame timing statistics.
+
+### 5. Encrypt a payload for replay
 
 ```bash
-python protocol_cracker.py encrypt '{"action":"collect"}' --key 5
+python -m game_protocol_cracker encrypt '{"action":"collect"}' --key 5
 ```
 
-## Frame Format
+Outputs the ciphertext in hex and the matching frame integrity byte.
 
-Default format (configurable via `--magic`):
+## CLI
+
+All commands accept these shared options:
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `--port` | unset | TCP port filter; also labels direction (S2C if `src_port == port`). |
+| `--frame-format` | `magic-prefixed` | Tokenizer: `magic-prefixed`, `length-prefixed`, `varint-prefixed`, `delimiter`. |
+| `--magic` | `0x70A3` | Magic word for `magic-prefixed` format (accepts hex/octal/decimal). |
+| `--wrap-at` | `0x70A3` | Rolling-key wrap value. |
+
+Commands:
+
+| Command | Summary |
+|---------|---------|
+| `crack PCAP [-o FILE] [--protobuf]` | Brute-force keys and decrypt everything. |
+| `decode PCAP --c2s-key N [--s2c-key N]` | Decrypt with known keys. |
+| `encrypt DATA --key N [--hex-input]` | Encrypt one message and compute its check byte. |
+| `analyze PCAP` | Print command frequency and timing stats. |
+| `list-plugins` | Show registered ciphers and frame formats. |
+
+Console scripts `game-protocol-cracker` and `gpc` are registered on install.
+
+## Frame formats
+
+Out of the box the tool ships four tokenizers; register your own through the
+plugin hooks if your target uses something exotic.
+
+### `magic-prefixed` (default)
 
 ```
-[2 bytes] Magic: 0x70A3
-[1 byte]  Flags
-[1 byte]  Check (payload checksum)
-[2 bytes] Command name length (big-endian)
-[N bytes] Command name (ASCII, e.g. "LoginReqC2S")
-[4 bytes] Payload length (big-endian)
-[M bytes] Payload (XOR encrypted)
+[2] magic (big-endian; --magic, default 0x70A3)
+[1] flags
+[1] check (integrity byte, see "Check byte" below)
+[2] cmd_len (big-endian)
+[N] cmd (ASCII, e.g. "LoginReqC2S")
+[4] data_len (big-endian)
+[M] data (XOR-encrypted payload)
 ```
 
-Command names are plaintext — only the payload is encrypted.
+### `length-prefixed`
 
-## Comparison with Other Tools
+2/4/8-byte length, then opaque body. Pass `body_split="ascii-delim"` via the
+Python API to split `cmd\0payload` bodies.
 
-| Tool | XOR Key Crack | Frame Parse | PCAP Support | Encrypt | Auto-Detect Key | Protobuf Decode |
-|------|:---:|:---:|:---:|:---:|:---:|:---:|
-| **game-protocol-cracker** | **Yes** | **Yes** | **Yes** | **Yes** | **Yes** | Planned |
-| [mitmproxy](https://mitmproxy.org/) | No | No | No | No | N/A | Plugin |
-| [Wireshark](https://wireshark.org/) | Manual | Custom dissector | Yes | No | No | Plugin |
-| [protobuf-inspector](https://github.com/mildsunrise/protobuf-inspector) | No | No | No | No | N/A | Yes (decode only) |
-| [scapy](https://scapy.net/) | Manual | Custom | Yes | Manual | No | No |
-| [InterceptSuite](https://github.com/InterceptSuite/InterceptSuite) | No | No | No | No | N/A | No |
-| Custom scripts | Manual | Manual | Manual | Manual | Manual | Manual |
+### `varint-prefixed`
 
-## Advanced: Replay Login + Own Crypto
+protobuf-style varint length, then opaque body. Pair with `--protobuf` for a
+schema-less dump.
 
-So I figured out a pattern that works really well for games where the login handshake is way more complex than the actual gameplay commands. Sharing it here because it took me a while to get right and I haven't seen it documented anywhere.
+### `delimiter`
 
-### The problem
+Bytes-delimited messages (newline-delimited JSON and friends).
 
-A lot of these games have a login flow that involves some nasty protobuf with nested fields, timestamps, device fingerprints, crypto nonces, etc. Trying to reconstruct that from scratch is painful. You decode it with blackboxprotobuf, modify one field, re-encode it, and the bytes come out different because field ordering isn't preserved. Server rejects it. Hours wasted.
-
-But here's the thing -- once you're logged in, the actual game commands are usually dead simple. Stuff like `{"action": "collect", "buildingId": 12}` wrapped in the XOR encryption we already cracked.
-
-### The trick
-
-Don't try to rebuild the login. Just replay the exact captured bytes.
-
-```bash
-# Step 1: capture a real login session
-adb shell su -c "tcpdump -i any -w /sdcard/login.pcap port 9929"
-# log into the game normally, then stop capture
-adb pull /sdcard/login.pcap
-
-# Step 2: extract the raw login frames
-python protocol_cracker.py crack login.pcap -o login_frames.json
-
-# Step 3: look at the login sequence
-# usually something like: LoginReqC2S -> LoginRspS2C -> AuthReqC2S -> AuthRspS2C
-```
-
-The login request bytes don't change between sessions for most of these games (or they change predictably -- sometimes there's a timestamp you can patch at a known offset). So you save those raw encrypted frames and replay them byte-for-byte to the server.
+## Python API
 
 ```python
-import socket
+from pathlib import Path
 
-# connect and replay the captured login bytes exactly
-sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-sock.connect(("game-server.example.com", 9929))
+from game_protocol_cracker import (
+    FrameParser,
+    MagicPrefixedFormat,
+    PcapReader,
+    RollingKeyCipher,
+    auto_detect_key,
+)
 
-# send the exact login frames from your capture (raw bytes, no re-encoding)
-with open("login_raw_frames.bin", "rb") as f:
-    for frame in parse_frames(f.read()):
-        sock.send(frame)
-        response = sock.recv(4096)
+parser = FrameParser(format=MagicPrefixedFormat(magic=0x70A3))
+frames = []
+for segment in PcapReader(path=Path("capture.pcap"), server_port=9000).iter_segments():
+    for frame in parser.parse(segment.payload):
+        frame.direction = segment.direction
+        frames.append(frame)
 
-# after login succeeds, you know the XOR key state
-# now use YOUR encryption for all subsequent commands
-key_state = 4  # wherever the key counter landed after login exchange
+guess = auto_detect_key(frames, direction="C2S")
+print(f"initial C2S key = {guess.key} (confidence {guess.confidence:.0%})")
 
-payload = '{"action":"collect","buildingId":12}'
-encrypted = encrypt_payload(payload, key_state)
-frame = build_frame("CollectReqC2S", encrypted)
-sock.send(frame)
+cipher = RollingKeyCipher(key=guess.key)
+for frame in frames:
+    if frame.direction == "C2S":
+        print(frame.cmd, cipher.decrypt(frame.data)[:64])
 ```
 
-### Why this works
+### Plugin hooks
 
-The login handshake has complex protobuf that's hard to reproduce exactly -- field ordering, varint encoding choices, optional fields the server checks for. But the server doesn't care HOW you got authenticated, just that the session is valid. Once you're past login, the commands are just simple JSON or flat protobuf payloads inside the XOR encryption that this tool already handles.
+Register custom variants and select them from the CLI (`--frame-format name`):
 
-### Important notes
+```python
+from game_protocol_cracker import (
+    FrameParser,
+    register_cipher,
+    register_frame_format,
+    RollingKeyCipher,
+)
 
-- The XOR key counter is sequential, so you need to track where it is after the login exchange. Count how many frames were sent/received during login to know the starting key for your own commands.
-- Some games rotate the server port or IP between sessions. Capture fresh if your replay stops working.
-- If the login has a timestamp field, find its byte offset in the raw frame and patch it. Usually it's a 4-byte unix timestamp at a consistent position. You can find it by capturing two logins and diffing the bytes.
-- This is obviously for security research on your own apps/games. Don't be stupid with it.
+# Custom cipher variant
+def my_cipher(**kwargs):
+    return RollingKeyCipher(wrap_at=0x4000, **kwargs)
 
-## Requirements
+register_cipher("my-variant", my_cipher)
 
-- Python 3.10+
-- No external dependencies for core functionality
-- Optional: `pip install bbpb` for Protobuf payload decoding
+# Custom frame format
+class MyFormat:
+    name = "my-format"
+    def iter_frames(self, buffer: bytes):
+        ...
 
-## Supported Protocols
+register_frame_format("my-format", lambda **kw: MyFormat())
+```
 
-This tool targets the specific XOR rolling-key pattern described above. Games known to use this or similar patterns include titles built with:
+## Algorithm
 
-- JuFeng game engine
-- 37Games SDK
-- Various Chinese mobile game frameworks
+For every message:
 
-The key derivation and frame format can be customized for other implementations.
+```
+key = key + 1
+if key == wrap_at: key = 0
+not_key = (~key) & 0xFFFFFFFF
+w8 = not_key & 0xFF
+w9 = ((not_key >> 4) & 0x0F) | ((w8 & 0xFF) << 4)
+```
+
+Per byte:
+
+```
+decrypt: plain  = ((~(cipher ^ w9)) & 0xFF - w8) & 0xFF
+encrypt: cipher = (~((w8 + plain) ^ w9)) & 0xFF
+```
+
+Optional integrity byte used by the magic-prefixed variant:
+
+```
+check = (~((sum(plaintext) + w8) ^ w9)) & 0xFF
+```
+
+## Auto-detection
+
+`auto_detect_key` sweeps candidate starting counters `0..max_key-1` per
+direction. Each decrypted candidate is scored on:
+
+1. **Protobuf wire-format validity** - how much of the plaintext parses as
+   a valid protobuf stream (most binary game payloads).
+2. **Printable-ASCII density** - for JSON or text payloads.
+
+The highest combined score wins; C2S and S2C are treated independently
+because real servers frequently start with different counters per direction.
+
+## Replay-after-login pattern
+
+Some games use a complex login handshake (nested protobuf, device
+fingerprints, nonces...) that is painful to rebuild. A pragmatic shortcut:
+
+1. Capture a full login session.
+2. Replay the captured login bytes verbatim on a fresh TCP connection.
+3. After the handshake completes, remember where the rolling counter landed
+   and start emitting your own encrypted frames from there.
+
+This works because the server only requires a valid authenticated session;
+it does not care how you reconstructed the login frames. Once authenticated,
+game commands are typically small protobuf or JSON blobs inside the same
+XOR envelope the rest of the tool already handles.
+
+## Comparison
+
+| Tool | XOR rolling key | Auto-detect key | Frame parser | pcap input | Protobuf decode | CLI |
+|------|:---:|:---:|:---:|:---:|:---:|:---:|
+| **game-protocol-cracker** | Yes | Yes | Yes | Yes | Optional | Yes |
+| [mitmproxy](https://mitmproxy.org/) | Plugin | No | No | No | Plugin | Yes |
+| [Wireshark](https://wireshark.org/) | Dissector | No | Dissector | Yes | Plugin | No |
+| [protobuf-inspector](https://github.com/mildsunrise/protobuf-inspector) | No | No | No | No | Yes | Yes |
+| [scapy](https://scapy.net/) | Manual | No | Manual | Yes | No | Partial |
+
+## Development
+
+```bash
+pip install -e ".[dev]"
+pytest --cov=game_protocol_cracker
+ruff check src/ tests/
+python tests/fixtures/generate_fixtures.py   # regenerate synthetic pcap
+```
+
+103 tests cover the crypto primitives, all frame formats, the pcap reader and
+the CLI end-to-end. The fixtures are synthetic; no real game traffic ships
+with the repository.
+
+## Contributing
+
+Bug reports and patches are welcome through GitHub issues and pull requests.
+Useful contributions include:
+
+* additional frame-format tokenizers
+* cipher variants seen in other games
+* regression fixtures built with `tests/fixtures/generate_fixtures.py`
+
+Please run `ruff check src/ tests/` and `pytest` before opening a PR.
+
+## Dependencies
+
+| Package | Purpose |
+|---------|---------|
+| [scapy](https://scapy.net/) | pcap/pcapng reading, TCP/IP parsing, test fixture generation |
+| [click](https://click.palletsprojects.com/) | CLI framework |
+| [rich](https://rich.readthedocs.io/) | Tabular terminal output |
+| [bbpb](https://github.com/nccgroup/blackboxprotobuf) *(optional)* | Schema-less protobuf decoding |
 
 ## License
 
-MIT
+MIT - see [LICENSE](LICENSE).
